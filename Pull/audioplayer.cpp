@@ -139,7 +139,7 @@ void AudioPlayer::start() {
     // 设置 notify 信号，减少触发频率避免过度调用
     m_audioOutput->setNotifyInterval(10);  // 改为10ms
     connect(m_audioOutput, &QAudioOutput::notify, this, &AudioPlayer::writeAudioData, Qt::UniqueConnection);
-
+    LogDebug << "输出缓冲区大小：" <<m_audioOutput->bufferSize();
     // 重置时钟
     m_clockTimer.restart();
     m_bytesWritten = 0;
@@ -371,6 +371,7 @@ void AudioPlayer::updateAudioClockFromBytes() {
         qint64 playedBytes = qMax(0LL, m_bytesWritten - bufferedBytes);
 
         m_audioClock = static_cast<qint64>(playedBytes / bytesPerMs);
+        LogDebug << "音频时钟:"<<m_audioClock;
         emit audioClockUpdated(m_audioClock);
     }
 }

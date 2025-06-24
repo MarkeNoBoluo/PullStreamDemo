@@ -25,6 +25,8 @@ RTSPSyncPull::RTSPSyncPull(QObject *parent)
     m_videoDecodeThread = new VideoDecodeThread(this);
     m_videoDecodeThread->setTargetSize(QSize(1280, 720));
     m_audioPlayer = new AudioPlayer(this);
+    // 连接信号槽
+    connectSignals();
 }
 
 RTSPSyncPull::~RTSPSyncPull()
@@ -67,8 +69,7 @@ void RTSPSyncPull::start(const QString &rtspUrl)
         return;
     }
 
-    // 连接信号槽
-    connectSignals();
+
     emit stateChanged(PushState::play,this->objectName());
 
     // 启动线程
@@ -177,6 +178,7 @@ void RTSPSyncPull::handleAudioDecoded(std::shared_ptr<AVFrame> frame) {
     if (frame->pts != AV_NOPTS_VALUE) {
         QMutexLocker locker(&m_clockMutex);
         m_audioClock = frame->pts;
+        qDebug() << "[AUDIO] pts:" << frame->pts << "ms";
     }
 
     if (m_audioPlayer) {
@@ -338,6 +340,7 @@ void RTSPSyncPull::connectSignals()
             m_audioClock = pts;
             // 通知视频解码线程音频时钟更新
             if (m_videoDecodeThread) {
+                LogDebug << "pts："<<pts;
                 m_videoDecodeThread->updateAudioClock(pts);
             }
         }, Qt::QueuedConnection);

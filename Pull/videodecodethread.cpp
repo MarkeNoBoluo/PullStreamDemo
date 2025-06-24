@@ -190,13 +190,14 @@ void VideoDecodeThread::run() {
 
             // 音视频同步：如果有音频时钟，尝试与其同步
             qint64 syncTarget = expectedTime;
-            if (m_audioClock > 0) {
+            qint64 audioClock = m_audioClock.load();
+            if (audioClock > 0) {
                 // 计算当前帧应该显示的时间戳
                 qint64 videoTime = static_cast<qint64>((frameNumber * 1000.0) / m_frameRate);
-                qint64 audioClock = m_audioClock.load();
 
-                // 如果视频超前音频太多，等待
                 qint64 diff = videoTime - audioClock;
+                qDebug() << "[SYNC] videoTime:" << videoTime << "ms, audioClock:" << audioClock << "ms, diff:" << diff << "ms";
+
                 if (diff > 40) {  // 超前40ms以上
                     QThread::msleep(static_cast<unsigned long>(qMin(diff / 2, 100LL)));
                 }
