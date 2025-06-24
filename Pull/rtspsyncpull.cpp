@@ -39,11 +39,12 @@ void RTSPSyncPull::start(const QString &rtspUrl)
         return;
     }
 
-    // 先停止当前播放
-    stop();
+//    // 先停止当前播放
+//    stop();
 
+    emit stateChanged(PushState::decode,this->objectName());
     // 设置拉流参数
-    m_pullThread->setTimeout(10000); // 10秒超时
+    m_pullThread->setTimeout(3000); // 10秒超时
     m_pullThread->setHardwareDecoding(true); // 启用硬件解码
 
     // 打开RTSP流
@@ -68,6 +69,7 @@ void RTSPSyncPull::start(const QString &rtspUrl)
 
     // 连接信号槽
     connectSignals();
+    emit stateChanged(PushState::play,this->objectName());
 
     // 启动线程
     m_pullThread->start();
@@ -80,6 +82,7 @@ void RTSPSyncPull::start(const QString &rtspUrl)
 
 void RTSPSyncPull::stop()
 {
+    emit stateChanged(PushState::end,this->objectName());
     // 断开信号连接
     disconnectSignals();
 
@@ -149,31 +152,33 @@ void RTSPSyncPull::resume()
 
     if (m_videoDecodeThread) {
         // 视频解码线程需要实现恢复功能
-        // m_videoDecodeThread->setPaused(false);
+//         m_videoDecodeThread->setPaused(false);
     }
 }
 
 void RTSPSyncPull::setVideoOutput(PlayImage *videoOutput)
 {
     m_videoOutput = videoOutput;
+    this->setObjectName("Plauer");
+    connect(this,&RTSPSyncPull::stateChanged,m_videoOutput,&PlayImage::onPlayState);
 }
 
-void RTSPSyncPull::handleAudioDecoded(std::shared_ptr<AVFrame> frame)
-{
+void RTSPSyncPull::handleAudioDecoded(std::shared_ptr<AVFrame> frame) {
     if (!frame) return;
 
-    // 更新音频时钟
+    // 首次收到音频帧时确保播放器已启动
+    static bool firstFrame = true;
+    if (firstFrame && m_audioPlayer) {
+        m_audioPlayer->start();
+        firstFrame = false;
+    }
+
+    // 更新时钟和发送帧...
     if (frame->pts != AV_NOPTS_VALUE) {
         QMutexLocker locker(&m_clockMutex);
         m_audioClock = frame->pts;
-
-        // 通知视频解码线程更新音频时钟
-        if (m_videoDecodeThread) {
-            m_videoDecodeThread->updateAudioClock(m_audioClock);
-        }
     }
 
-    // 将音频帧发送给播放器
     if (m_audioPlayer) {
         m_audioPlayer->onAudioFrameReady(frame);
     }
@@ -200,8 +205,18 @@ bool RTSPSyncPull::initializeDecoders()
                 return false;
             }
 
-            // 设置目标音频格式
-            m_audioDecodeThread->setTargetFormat(44100, 2, AV_SAMPLE_FMT_S16);
+            // 关键修改：使用原始采样率，不强制转换
+            int originalSampleRate = audioParams->sample_rate;
+            int originalChannels = audioParams->channels;
+
+            // 如果原始采样率异常，使用默认值
+            if (originalSampleRate <= 0) originalSampleRate = 44100;
+            if (originalChannels <= 0) originalChannels = 2;
+
+            LogInfo << "原始音频参数: " << originalSampleRate << "Hz, " << originalChannels << "ch";
+
+            // 设置目标音频格式（保持原始采样率）
+            m_audioDecodeThread->setTargetFormat(originalSampleRate, originalChannels, AV_SAMPLE_FMT_S16);
         }
     }
 
@@ -215,7 +230,7 @@ bool RTSPSyncPull::initializeDecoders()
             }
 
             // 启用硬件解码
-            m_videoDecodeThread->setHardwareDecoding(true);
+            m_videoDecodeThread->setHardwareDecoding(false);
 
             // 设置目标尺寸（可选）
             if (m_videoOutput) {
@@ -230,18 +245,27 @@ bool RTSPSyncPull::initializeDecoders()
 bool RTSPSyncPull::initializeAudioPlayer()
 {
     if (m_pullThread->audioStreamIndex() < 0) {
-        return true; // 没有音频流，不需要初始化
+        LogDebug << "没有音频流，不需要初始化";
+        return true;
     }
 
-    // 使用解码器设置的音频参数
+    // 关键修改：使用与解码器相同的音频参数
     int sampleRate = m_audioDecodeThread->sampleRate();
     int channels = m_audioDecodeThread->channels();
 
+    LogInfo << "初始化音频播放器: " << sampleRate << "Hz, " << channels << "ch";
+
+    // 增加缓冲区大小，改善播放稳定性
+    m_audioPlayer->setMaxBufferSize(6144);
+
+    // 使用正确的采样率初始化音频播放器
     if (!m_audioPlayer->initialize(sampleRate, channels, 16)) {
         LogErr << "音频播放器初始化失败";
         return false;
     }
 
+    m_audioPlayer->setVolume(0.5f);
+    LogInfo << "音频播放器初始化成功";
     return true;
 }
 
@@ -267,9 +291,13 @@ void RTSPSyncPull::connectSignals()
             if (m_videoOutput) {
                 emit m_videoOutput->updatePlayWindowSize(QSize(width, height));
             }
+            if(m_videoDecodeThread){
+                m_videoDecodeThread->setFrameRate(frameRate);
+            }
         }, Qt::QueuedConnection);
 
     // 音频解码线程信号连接
+    qRegisterMetaType<std::shared_ptr<AVFrame>>("std::shared_ptr<AVFrame>");
     connect(m_audioDecodeThread, &AudioDecodeThread::audioFrameDecoded,
             this, &RTSPSyncPull::handleAudioDecoded,
             Qt::QueuedConnection);

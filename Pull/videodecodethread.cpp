@@ -77,7 +77,6 @@ bool VideoDecodeThread::init(AVCodecParameters *codecParams) {
         m_targetSize = m_videoSize;
     }
 
-
     LogInfo << "Video decoder initialized: "
             << "Codec: " << m_codec->name
             << " Size: " << m_videoSize.width() << "x" << m_videoSize.height()
@@ -127,7 +126,10 @@ void VideoDecodeThread::close() {
 }
 
 void VideoDecodeThread::onVideoPacketReceived(AVPacket *packet) {
-    if (!m_running || !packet) return;
+    if (!m_running || !packet) {
+        LogErr << "音频包数据为空";
+        return;
+    }
 
     QMutexLocker locker(&m_queueMutex);
 
@@ -155,34 +157,24 @@ void VideoDecodeThread::run() {
     QElapsedTimer frameTimer;
     frameTimer.start();
 
-    int64_t lastPts = AV_NOPTS_VALUE;
-    double frameDuration = 0;
+    qint64 lastFrameTime = 0;
+    qint64 frameNumber = 0;
 
-    if (m_frameRate > 0) {
-        frameDuration = 1000.0 / m_frameRate;
-    }
-
-    while (m_running) {
+    while (m_running || !m_flushing) {
         AVPacket *packet = nullptr;
 
-        // 从队列获取数据包
         {
             QMutexLocker locker(&m_queueMutex);
-
             if (m_packetQueue.isEmpty()) {
                 if (m_flushing) {
-                    // 没有更多数据包且处于刷新状态，退出循环
                     break;
                 }
-                // 等待新数据包
                 m_queueCondition.wait(&m_queueMutex, 100);
                 continue;
             }
-
             packet = m_packetQueue.dequeue();
         }
 
-        // 处理数据包
         if (packet) {
             if (!decodePacket(packet)) {
                 av_packet_free(&packet);
@@ -191,26 +183,43 @@ void VideoDecodeThread::run() {
             av_packet_free(&packet);
         }
 
-        // 帧同步处理
-        if (lastPts != AV_NOPTS_VALUE && frameDuration > 0) {
-            int64_t elapsed = frameTimer.elapsed();
-            int64_t expected = static_cast<int64_t>(frameDuration * (m_frame->pts - lastPts));
+        // 改进的帧率控制和音视频同步
+        if (m_frameRate > 0) {
+            qint64 currentTime = frameTimer.elapsed();
+            qint64 expectedTime = static_cast<qint64>((frameNumber * 1000.0) / m_frameRate);
 
-            if (elapsed < expected) {
-                QThread::msleep(expected - elapsed);
+            // 音视频同步：如果有音频时钟，尝试与其同步
+            qint64 syncTarget = expectedTime;
+            if (m_audioClock > 0) {
+                // 计算当前帧应该显示的时间戳
+                qint64 videoTime = static_cast<qint64>((frameNumber * 1000.0) / m_frameRate);
+                qint64 audioClock = m_audioClock.load();
+
+                // 如果视频超前音频太多，等待
+                qint64 diff = videoTime - audioClock;
+                if (diff > 40) {  // 超前40ms以上
+                    QThread::msleep(static_cast<unsigned long>(qMin(diff / 2, 100LL)));
+                }
+                // 如果视频落后音频太多，跳帧
+                else if (diff < -100) {  // 落后100ms以上
+                    LogDebug << "跳帧同步: 视频落后音频" << -diff << "ms";
+                    frameNumber++; // 跳过此帧
+                    continue;
+                }
             }
-        }
 
-        lastPts = m_frame->pts;
-        frameTimer.restart();
+            // 基本帧率控制
+            qint64 waitTime = expectedTime - currentTime;
+            if (waitTime > 0 && waitTime < 200) {  // 最多等待200ms
+                QThread::msleep(static_cast<unsigned long>(waitTime));
+            }
+
+            frameNumber++;
+        }
     }
 
-    // 刷新解码器
     decodePacket(nullptr);
-
-    // 发送结束信号
     emit videoFrameDecoded(QImage());
-
     LogInfo << "Video decoding thread stopped";
 }
 
@@ -265,8 +274,8 @@ bool VideoDecodeThread::createSwsContext() {
 
     // 确定源像素格式（硬件解码时使用软件帧格式）
     AVPixelFormat srcFormat = m_hardwareDecoding ?
-                                  static_cast<AVPixelFormat>(m_hwFrame->format) :
-                                  static_cast<AVPixelFormat>(m_frame->format);
+                              m_hwPixelFormat  :
+                              static_cast<AVPixelFormat>(m_frame->format);
 
     // 创建SWS上下文
     m_swsContext = sws_getContext(
@@ -372,7 +381,8 @@ void VideoDecodeThread::processDecodedFrame(AVFrame *frame) {
     }
 }
 
-QImage VideoDecodeThread::convertFrameToImage(AVFrame *frame) {
+QImage VideoDecodeThread::convertFrameToImage(AVFrame *frame)
+{
     uint8_t *dstData[1] = { m_imageBuffer.get() };
     int dstLinesize[1] = { m_targetSize.width() * 4 };
 
@@ -444,4 +454,14 @@ void VideoDecodeThread::cleanup() {
     m_hwPixelFormat = AV_PIX_FMT_NONE;
 
     LogInfo << "Video decoder resources cleaned up";
+}
+
+double VideoDecodeThread::frameRate() const
+{
+    return m_frameRate;
+}
+
+void VideoDecodeThread::setFrameRate(double newFrameRate)
+{
+    m_frameRate = newFrameRate;
 }

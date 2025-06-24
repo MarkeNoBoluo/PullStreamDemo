@@ -73,6 +73,9 @@ private:
     QMutex m_queueMutex;
     QWaitCondition m_queueCondition;
 
+    int m_maxQueueSize = 100;
+    bool m_dropFrames = false;
+
     // 音频参数
     int m_targetSampleRate = 44100;
     int m_targetChannels = 2;

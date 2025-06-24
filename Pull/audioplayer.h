@@ -47,6 +47,8 @@ public:
     // 获取当前音频时钟 (毫秒)
     qint64 audioClock() ;
 
+    void setMaxBufferSize(int newMaxBufferSize);
+
 public slots:
     // 接收音频帧
     void onAudioFrameReady(std::shared_ptr<AVFrame> frame);
@@ -74,6 +76,10 @@ private:
     // 设置音频格式
     void setupAudioFormat();
 
+    int getBufferDelayMs() const;
+
+    void updateAudioClockFromBytes();
+
     // 转换音频帧
     QByteArray convertAudioFrame(std::shared_ptr<AVFrame> frame);
 
@@ -91,6 +97,8 @@ private:
     QQueue<QByteArray> m_audioBuffer;
     mutable QMutex m_bufferMutex;
 
+    int m_maxBufferSize = 1024;
+
     // 音频时钟
     qint64 m_audioClock = 0;
     QMutex m_clockMutex;
@@ -100,12 +108,10 @@ private:
     std::atomic_bool m_playing{false};
     std::atomic_bool m_paused{false};
 
-    // 写入定时器
-    QTimer *m_writeTimer = nullptr;
-
     // 性能统计
     qint64 m_bytesWritten = 0;
     QElapsedTimer m_clockTimer;
+
 };
 
 #endif // AUDIOPLAYER_H

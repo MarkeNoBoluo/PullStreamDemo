@@ -36,6 +36,7 @@ signals:
     void errorOccurred(const QString &error);
     void playbackStarted();
     void playbackStopped();
+    void stateChanged(PushState state,const QString &objName);
 
 public slots:
     void handleAudioDecoded(std::shared_ptr<AVFrame> frame);

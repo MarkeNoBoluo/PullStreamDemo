@@ -26,23 +26,17 @@ bool StreamPullThread::open(const QString &url, int timeoutMs)
 
     m_timeoutMs = timeoutMs;
 
-    // 设置连接参数
-    av_dict_set(&m_options, "rtsp_transport", "tcp", 0);
-    av_dict_set(&m_options, "stimeout", QString::number(m_timeoutMs * 1000).toUtf8(), 0);
-    av_dict_set(&m_options, "max_delay", "500", 0);
-    av_dict_set(&m_options, "reorder_queue_size", "1000", 0);
-    av_dict_set(&m_options, "analyzeduration", "1000000", 0);
-    av_dict_set(&m_options, "probesize", "1000000", 0);
-
     // 打开输入流
     if (!openInput(url)) {
         cleanup();
+        LogErr << "打开输入流失败";
         return false;
     }
 
     // 查找流信息
     if (!findStreamInfo()) {
         cleanup();
+        LogErr << "查找流信息失败";
         return false;
     }
 
@@ -72,22 +66,26 @@ void StreamPullThread::close()
     cleanup();
 }
 
-void StreamPullThread::setHardwareDecoding(bool enable) {
+void StreamPullThread::setHardwareDecoding(bool enable)
+{
     m_hardwareDecoding = enable;
 }
 
-void StreamPullThread::setTimeout(int timeoutMs) {
+void StreamPullThread::setTimeout(int timeoutMs)
+{
     m_timeoutMs = timeoutMs;
 }
 
-AVCodecParameters* StreamPullThread::videoCodecParameters() const {
+AVCodecParameters* StreamPullThread::videoCodecParameters() const
+{
     if (m_videoStreamIndex >= 0 && m_formatContext) {
         return m_formatContext->streams[m_videoStreamIndex]->codecpar;
     }
     return nullptr;
 }
 
-AVCodecParameters* StreamPullThread::audioCodecParameters() const {
+AVCodecParameters* StreamPullThread::audioCodecParameters() const
+{
     if (m_audioStreamIndex >= 0 && m_formatContext) {
         return m_formatContext->streams[m_audioStreamIndex]->codecpar;
     }
@@ -102,8 +100,9 @@ void StreamPullThread::run()
         return;
     }
 
-    QElapsedTimer timer;
-    timer.start();
+    // 增加错误计数器
+    int consecutiveErrors = 0;
+    const int maxConsecutiveErrors = 50; // 允许的最大连续错误数
 
     while (m_running) {
         int ret = av_read_frame(m_formatContext, packet);
@@ -113,21 +112,17 @@ void StreamPullThread::run()
                 LogInfo << "End of stream reached";
                 break;
             }
+            // 增加错误计数
+            consecutiveErrors++;
 
-            // 检查超时
-            if (timer.elapsed() > m_timeoutMs) {
-                emit errorOccurred("Stream read timeout");
+            if (consecutiveErrors > maxConsecutiveErrors) {
+                emit errorOccurred("Too many consecutive read errors");
                 break;
             }
-
-            // 短暂休眠后重试
-            QThread::msleep(10);
             continue;
         }
-
-        // 重置超时计时器
-        timer.restart();
-
+        // 重置错误计数器
+        consecutiveErrors = 0;
         // 处理数据包
         processPacket(packet);
 
@@ -135,53 +130,67 @@ void StreamPullThread::run()
         av_packet_unref(packet);
     }
 
-    // 发送空包表示结束
+    // 修改结束包发送（动态分配）
     if (m_running) {
-        AVPacket eofPacket;
-        av_init_packet(&eofPacket);
-        eofPacket.data = nullptr;
-        eofPacket.size = 0;
-        eofPacket.stream_index = m_videoStreamIndex;
-        emit videoPacketReady(&eofPacket);
+        // 视频结束包
+        AVPacket *videoEof = av_packet_alloc();
+        if (videoEof) {
+            videoEof->data = nullptr;
+            videoEof->size = 0;
+            videoEof->stream_index = m_videoStreamIndex;
+            emit videoPacketReady(videoEof);
+        }
 
-        eofPacket.stream_index = m_audioStreamIndex;
-        emit audioPacketReady(&eofPacket);
+        // 音频结束包
+        AVPacket *audioEof = av_packet_alloc();
+        if (audioEof) {
+            audioEof->data = nullptr;
+            audioEof->size = 0;
+            audioEof->stream_index = m_audioStreamIndex;
+            emit audioPacketReady(audioEof);
+        }
     }
 
     av_packet_free(&packet);
 }
 
-bool StreamPullThread::openInput(const QString &url) {
+bool StreamPullThread::openInput(const QString &url)
+{
+
+    //设置输入上下文的参数配置
+    av_dict_set(&m_options, "rtsp_transport", "tcp", 0);
+    av_dict_set(&m_options, "max_delay", "500", 0);
+//    av_dict_set(&m_options, "timeout", QString::number(m_timeoutMs).toUtf8(), 0);
+    av_dict_set(&m_options, "stimeout", "30000000", 0); // 30秒心跳
     // 分配格式上下文
     m_formatContext = avformat_alloc_context();
     if (!m_formatContext) {
         emit errorOccurred("Failed to allocate format context");
+        LogErr << "分配格式上下文失败";
         return false;
     }
 
     // 打开输入流
     int ret = avformat_open_input(&m_formatContext, url.toUtf8().constData(), nullptr, &m_options);
+    // 释放参数字典
+    if(m_options)
+        av_dict_free(&m_options);
     if (ret < 0) {
         char error[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(ret, error, sizeof(error));
         emit errorOccurred(QString("Failed to open input: %1").arg(error));
+        LogErr << "打开输入流失败";
         return false;
     }
 
     return true;
 }
 
-bool StreamPullThread::findStreamInfo() {
-    // 设置超时参数
-    AVDictionary *probeOptions = nullptr;
-    av_dict_set(&probeOptions, "timeout", QString::number(m_timeoutMs * 1000).toUtf8(), 0);
+bool StreamPullThread::findStreamInfo()
+{
 
     // 查找流信息
-    int ret = avformat_find_stream_info(m_formatContext, &probeOptions);
-    if (probeOptions) {
-        av_dict_free(&probeOptions);
-    }
-
+    int ret = avformat_find_stream_info(m_formatContext, nullptr);
     if (ret < 0) {
         char error[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(ret, error, sizeof(error));
@@ -202,10 +211,6 @@ bool StreamPullThread::findStreamInfo() {
 
         if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO && m_videoStreamIndex < 0) {
             m_videoStreamIndex = i;
-            LogInfo << "Found video stream: index=" << i
-                    << " codec=" << avcodec_get_name(codecpar->codec_id)
-                    << " resolution=" << codecpar->width << "x" << codecpar->height;
-
             // 发送视频流信息
             double frameRate = av_q2d(stream->avg_frame_rate);
             if (frameRate <= 0) frameRate = av_q2d(stream->r_frame_rate);
@@ -213,10 +218,6 @@ bool StreamPullThread::findStreamInfo() {
         }
         else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO && m_audioStreamIndex < 0) {
             m_audioStreamIndex = i;
-            LogInfo << "Found audio stream: index=" << i
-                    << " codec=" << avcodec_get_name(codecpar->codec_id)
-                    << " channels=" << codecpar->channels
-                    << " sample_rate=" << codecpar->sample_rate;
         }
     }
 
@@ -228,7 +229,8 @@ bool StreamPullThread::findStreamInfo() {
     return true;
 }
 
-void StreamPullThread::processPacket(AVPacket *packet) {
+void StreamPullThread::processPacket(AVPacket *packet)
+{
     if (packet->stream_index == m_videoStreamIndex) {
         // 复制视频包
         AVPacket *videoPacket = av_packet_alloc();
@@ -240,6 +242,7 @@ void StreamPullThread::processPacket(AVPacket *packet) {
         AVPacket *audioPacket = av_packet_alloc();
         av_packet_ref(audioPacket, packet);
         emit audioPacketReady(audioPacket);
+
     }
 }
 

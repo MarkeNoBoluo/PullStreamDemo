@@ -43,6 +43,10 @@ bool AudioDecodeThread::init(AVCodecParameters *codecParams)
         return false;
     }
 
+    // 设置低延迟选项
+    m_codecContext->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    m_codecContext->flags2 |= AV_CODEC_FLAG2_FAST;
+
     // 打开解码器
     ret = avcodec_open2(m_codecContext, m_codec, nullptr);
     if (ret < 0) {
@@ -74,9 +78,9 @@ bool AudioDecodeThread::init(AVCodecParameters *codecParams)
 }
 
 void AudioDecodeThread::setTargetFormat(int sampleRate, int channels, AVSampleFormat format) {
+    m_targetFormat = AV_SAMPLE_FMT_S16;
     m_targetSampleRate = sampleRate;
     m_targetChannels = channels;
-    m_targetFormat = format;
 
     // 重新初始化重采样器
     if (m_swrContext) {
@@ -110,18 +114,32 @@ void AudioDecodeThread::close() {
 }
 
 void AudioDecodeThread::onAudioPacketReceived(AVPacket *packet) {
-    if (!m_running || !packet) return;
+    if (!m_running || !packet) {
+        LogErr << "音频包数据为空";
+        return;
+    }
 
     QMutexLocker locker(&m_queueMutex);
 
     // 空包表示流结束
     if (packet->size == 0 && packet->data == nullptr) {
         m_flushing = true;
-        av_packet_free(&packet);
-        m_queueCondition.wakeAll();
-        return;
+        // 不释放，直接加入队列
     }
 
+    // 检查队列大小，防止内存溢出
+    if (m_packetQueue.size() >= m_maxQueueSize) {
+        LogWarn << "Audio packet queue overflow, dropping oldest packets";
+
+        // 丢弃旧的数据包
+        while (m_packetQueue.size() >= m_maxQueueSize / 2) {
+            AVPacket *oldPacket = m_packetQueue.dequeue();
+            av_packet_free(&oldPacket);
+        }
+
+        m_dropFrames = true;  // 设置丢帧标志
+    }
+    LogInfo << "音频包数据添加到队列";
     // 添加到队列
     m_packetQueue.enqueue(packet);
     m_queueCondition.wakeOne();
@@ -140,9 +158,7 @@ void AudioDecodeThread::run() {
     m_running = true;
     m_flushing = false;
     m_paused = false;
-
-    QElapsedTimer decodeTimer;
-    decodeTimer.start();
+    m_dropFrames = false;
 
     while (m_running) {
         // 处理暂停状态
@@ -173,16 +189,24 @@ void AudioDecodeThread::run() {
 
         // 处理数据包
         if (packet) {
+
+            // 如果设置了丢帧标志，跳过非关键帧
+            if (m_dropFrames  && packet->data != nullptr) {
+                av_packet_free(&packet);
+                LogWarn << "丢帧";
+                continue;
+            }
+
             if (decodePacket(packet)) {
-                // 更新解码性能统计
-                if (decodeTimer.elapsed() > 1000) {
-                    LogDebug << "Audio decode rate: "
-                             << m_packetQueue.size() << " packets in queue";
-                    decodeTimer.restart();
+                // 如果队列大小恢复正常，清除丢帧标志
+                if (m_dropFrames && m_packetQueue.size() < m_maxQueueSize / 4) {
+                    m_dropFrames = false;
+                    LogInfo << "Audio queue recovered, resuming normal processing";
                 }
             }
             av_packet_free(&packet);
         }
+
     }
 
     // 刷新解码器
@@ -194,15 +218,31 @@ void AudioDecodeThread::run() {
     LogInfo << "Audio decoding thread stopped";
 }
 
-bool AudioDecodeThread::initResampler() {
-    // 释放现有重采样器
+bool AudioDecodeThread::initResampler()
+{
     if (m_swrContext) {
         swr_free(&m_swrContext);
     }
 
-    // 设置重采样参数
+    // 获取输入和输出通道布局
     int64_t inChannelLayout = av_get_default_channel_layout(m_codecContext->channels);
     int64_t outChannelLayout = av_get_default_channel_layout(m_targetChannels);
+
+    LogInfo << "重采样器配置: "
+            << "输入: " << av_get_sample_fmt_name(m_codecContext->sample_fmt)
+            << " @ " << m_codecContext->sample_rate << "Hz, " << m_codecContext->channels << "ch"
+            << " -> 输出: " << av_get_sample_fmt_name(m_targetFormat)
+            << " @ " << m_targetSampleRate << "Hz, " << m_targetChannels << "ch";
+
+    // 检查是否需要重采样
+    bool needResampling = (m_codecContext->sample_rate != m_targetSampleRate) ||
+                         (m_codecContext->channels != m_targetChannels) ||
+                         (m_codecContext->sample_fmt != m_targetFormat);
+
+    if (!needResampling) {
+        LogInfo << "音频参数匹配，无需重采样";
+        return true;  // 不需要重采样
+    }
 
     // 创建重采样上下文
     m_swrContext = swr_alloc_set_opts(
@@ -215,14 +255,13 @@ bool AudioDecodeThread::initResampler() {
         m_codecContext->sample_rate,
         0,
         nullptr
-        );
+    );
 
     if (!m_swrContext) {
         emit errorOccurred("Failed to allocate resampler context");
         return false;
     }
 
-    // 初始化重采样器
     int ret = swr_init(m_swrContext);
     if (ret < 0) {
         char error[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -232,13 +271,7 @@ bool AudioDecodeThread::initResampler() {
         return false;
     }
 
-    LogInfo << "Audio resampler initialized: "
-            << av_get_sample_fmt_name(m_codecContext->sample_fmt) << " @ "
-            << m_codecContext->sample_rate << "Hz -> "
-            << av_get_sample_fmt_name(m_targetFormat) << " @ "
-            << m_targetSampleRate << "Hz, "
-            << m_codecContext->channels << "ch -> " << m_targetChannels << "ch";
-
+    LogInfo << "Audio resampler initialized successfully";
     return true;
 }
 
@@ -259,6 +292,7 @@ bool AudioDecodeThread::decodePacket(AVPacket *packet) {
     while (ret >= 0) {
         ret = avcodec_receive_frame(m_codecContext, m_frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            LogWarn << "监测到结束符,ret"<< ret;
             return true;
         }
         if (ret < 0) {
@@ -281,6 +315,7 @@ bool AudioDecodeThread::decodePacket(AVPacket *packet) {
         auto resampledFrame = resampleFrame(m_frame);
         if (resampledFrame) {
             // 发送重采样后的帧
+            LogWarn << "发送重采样后的帧";
             emit audioFrameDecoded(resampledFrame);
         }
 
@@ -292,9 +327,22 @@ bool AudioDecodeThread::decodePacket(AVPacket *packet) {
 }
 
 std::shared_ptr<AVFrame> AudioDecodeThread::resampleFrame(AVFrame *frame) {
+    // 如果不需要重采样，直接复制帧
     if (!m_swrContext) {
-        LogWarn << "Resampler not initialized";
-        return nullptr;
+        AVFrame *outFrame = av_frame_alloc();
+        if (!outFrame) {
+            LogWarn << "Failed to allocate output frame";
+            return nullptr;
+        }
+
+        if (av_frame_ref(outFrame, frame) < 0) {
+            av_frame_free(&outFrame);
+            return nullptr;
+        }
+
+        return std::shared_ptr<AVFrame>(outFrame, [](AVFrame *f) {
+            if (f) av_frame_free(&f);
+        });
     }
 
     // 计算输出样本数
@@ -340,15 +388,11 @@ std::shared_ptr<AVFrame> AudioDecodeThread::resampleFrame(AVFrame *frame) {
         return nullptr;
     }
 
-    // 设置实际样本数
     outFrame->nb_samples = ret;
-
-    // 复制时间戳
     outFrame->pts = frame->pts;
 
-    // 使用智能指针管理帧内存
     return std::shared_ptr<AVFrame>(outFrame, [](AVFrame *f) {
-        av_frame_free(&f);
+        if (f) av_frame_free(&f);
     });
 }
 
@@ -384,6 +428,7 @@ void AudioDecodeThread::cleanup() {
     m_running = false;
     m_paused = false;
     m_flushing = false;
+    m_dropFrames = false;
 
     LogInfo << "Audio decoder resources cleaned up";
 }

@@ -33,6 +33,9 @@ public:
     // 获取视频尺寸
     QSize videoSize() const { return m_videoSize; }
 
+    double frameRate() const;
+    void setFrameRate(double newFrameRate);
+
 signals:
     // 视频帧就绪信号
     void videoFrameDecoded(const QImage& image);
@@ -81,6 +84,7 @@ private:
     AVFrame *m_hwFrame = nullptr;
     enum AVPixelFormat m_hwPixelFormat = AV_PIX_FMT_NONE;
 
+
     // 转换
     SwsContext *m_swsContext = nullptr;
     std::unique_ptr<uint8_t[]> m_imageBuffer;
@@ -100,7 +104,7 @@ private:
     QSize m_targetSize;
     QSize m_videoSize;
     double m_frameRate = 0.0;
-    qint64 m_audioClock = 0;
+    std::atomic<qint64> m_audioClock{0};
 };
 
 #endif // VIDEODECODETHREAD_H
